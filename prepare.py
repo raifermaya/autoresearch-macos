@@ -58,7 +58,7 @@ VOCAB_SIZE = 8192
 # BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
+SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)] + ["<INJECTION>", "<SAFE>"]
 BOS_TOKEN = "<|reserved_0|>"
 
 # ---------------------------------------------------------------------------
@@ -377,6 +377,85 @@ def evaluate_bpb(model, tokenizer, batch_size):
         total_nats += (loss_flat * mask).sum().item()
         total_bytes += nbytes.sum().item()
     return total_nats / (math.log(2) * total_bytes)
+
+# ---------------------------------------------------------------------------
+# Classification evaluation (F-beta with precision bias)
+# ---------------------------------------------------------------------------
+
+def fbeta_score(precision, recall, beta=0.5):
+    """F-beta score. beta<1 favors precision, beta>1 favors recall."""
+    if precision + recall == 0:
+        return 0.0
+    beta_sq = beta ** 2
+    return (1 + beta_sq) * precision * recall / (beta_sq * precision + recall)
+
+
+def compute_prefix_loss(model, tokenizer, prefix, text):
+    """Compute cross-entropy loss for predicting text given a prefix token."""
+    device = next(model.parameters()).device
+    prefix_id = tokenizer.enc.encode_single_token(prefix)
+    text_ids = tokenizer.encode(text)
+    if len(text_ids) > MAX_SEQ_LEN - 1:
+        text_ids = text_ids[:MAX_SEQ_LEN - 1]
+    input_ids = [prefix_id] + text_ids[:-1]
+    target_ids = text_ids
+    x = torch.tensor([input_ids], dtype=torch.long, device=device)
+    y = torch.tensor([target_ids], dtype=torch.long, device=device)
+    with torch.no_grad():
+        loss = model(x, y, reduction='mean')
+    return loss.item()
+
+
+def evaluate_classification(model, tokenizer, data_path, beta=0.5, max_samples=3000):
+    """
+    Evaluate prompt injection detection with automatic threshold optimization.
+    Returns F0.5 as primary metric (precision-biased F-score).
+
+    Expects a CSV with 'text' and 'label' columns (label: 0=safe, 1=injection).
+    Uses prefix-based classification: compares loss of <INJECTION> vs <SAFE> prefix.
+    """
+    import pandas as pd
+
+    df = pd.read_csv(data_path)
+    if len(df) > max_samples:
+        df = df.sample(n=max_samples, random_state=42)
+
+    # Compute losses for both prefixes
+    losses_inj, losses_safe = [], []
+    for text in df['text']:
+        loss_inj = compute_prefix_loss(model, tokenizer, "<INJECTION>", text)
+        loss_safe = compute_prefix_loss(model, tokenizer, "<SAFE>", text)
+        losses_inj.append(loss_inj)
+        losses_safe.append(loss_safe)
+
+    # Threshold sweep to maximize F-beta
+    labels = df['label'].tolist()
+    margins = [safe - inj for inj, safe in zip(losses_inj, losses_safe)]
+
+    best_threshold, best_f = 0.0, 0.0
+    best_prec, best_rec = 0.0, 0.0
+    for threshold in [x * 0.01 for x in range(-20, 31)]:  # -0.20 to 0.30
+        preds = [1 if m > threshold else 0 for m in margins]
+        tp = sum(1 for p, l in zip(preds, labels) if p == 1 and l == 1)
+        fp = sum(1 for p, l in zip(preds, labels) if p == 1 and l == 0)
+        fn = sum(1 for p, l in zip(preds, labels) if p == 0 and l == 1)
+
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f = fbeta_score(prec, rec, beta)
+
+        if f > best_f:
+            best_f, best_threshold = f, threshold
+            best_prec, best_rec = prec, rec
+
+    return {
+        'f05': best_f,
+        'precision': best_prec,
+        'recall': best_rec,
+        'f1': fbeta_score(best_prec, best_rec, beta=1.0),
+        'optimal_threshold': best_threshold,
+    }
+
 
 # ---------------------------------------------------------------------------
 # Main

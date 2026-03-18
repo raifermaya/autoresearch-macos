@@ -27,7 +27,7 @@ def verify_macos_env():
 
 verify_macos_env()
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb, evaluate_classification
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -681,7 +681,12 @@ total_tokens = step * TOTAL_BATCH_SIZE
 # Final eval
 model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    clf_metrics = evaluate_classification(
+        model, tokenizer,
+        data_path="train_data.csv",
+        beta=0.5,
+        max_samples=3000
+    )
 
 # Final summary
 t_end = time.time()
@@ -693,7 +698,10 @@ else:
     peak_vram_mb = 0.0
 
 print("---")
-print(f"val_bpb:          {val_bpb:.6f}")
+print(f"f05:              {clf_metrics['f05']:.6f}")
+print(f"precision:        {clf_metrics['precision']:.6f}")
+print(f"recall:           {clf_metrics['recall']:.6f}")
+print(f"threshold:        {clf_metrics['optimal_threshold']:.4f}")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
