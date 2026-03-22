@@ -208,12 +208,14 @@ for input_ids, attention_mask, labels in train_loader:
     sync_device(device_type)
     t0 = time.time()
 
-    # LR schedule
+    # LR schedule with cosine annealing
+    import math
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     if progress < WARMUP_RATIO:
         lr_mult = progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
     else:
-        lr_mult = 1.0 - (progress - WARMUP_RATIO) / (1.0 - WARMUP_RATIO)
+        decay_progress = (progress - WARMUP_RATIO) / (1.0 - WARMUP_RATIO)
+        lr_mult = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
     lr = LEARNING_RATE * max(lr_mult, 0.1)
     for g in optimizer.param_groups:
         g['lr'] = lr
