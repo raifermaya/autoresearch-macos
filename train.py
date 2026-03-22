@@ -134,7 +134,7 @@ class Classifier(nn.Module):
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-DEPTH = 3
+DEPTH = 2
 N_HEAD = 6
 N_EMBD = 384
 DROPOUT = 0.1
