@@ -144,7 +144,7 @@ DROPOUT = 0.1
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 0.01
-WARMUP_RATIO = 0.1
+WARMUP_RATIO = 0.2
 NUM_CLASSES = 2
 
 # ---------------------------------------------------------------------------
