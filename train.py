@@ -121,9 +121,12 @@ class Classifier(nn.Module):
             x = block(x, attention_mask)
 
         x = norm(x)
-        # Pool: use CLS token (first position)
-        cls_output = x[:, 0, :]
-        logits = self.classifier(cls_output)
+        # Pool: max pooling over sequence
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(-1).float()
+            x = x.masked_fill(mask == 0, float('-inf'))
+        pooled = x.max(dim=1)[0]
+        logits = self.classifier(pooled)
         return logits
 
     def num_params(self):
