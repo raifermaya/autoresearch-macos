@@ -42,90 +42,38 @@ class ClassifierConfig:
     dropout: float = 0.1
 
 
-def norm(x):
-    return F.rms_norm(x, (x.size(-1),))
-
-
-class SelfAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x, attention_mask=None):
-        B, T, C = x.size()
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = self.c_k(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-
-        # Scaled dot-product attention with mask
-        if attention_mask is not None:
-            # attention_mask: [B, T] -> [B, 1, 1, T]
-            attn_mask = attention_mask[:, None, None, :].float()
-            attn_mask = (1.0 - attn_mask) * -1e9
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        else:
-            y = F.scaled_dot_product_attention(q, k, v)
-
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.dropout(self.c_proj(y))
-        return y
-
-
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = F.gelu(x)
-        x = self.dropout(self.c_proj(x))
-        return x
-
-
-class Block(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.attn = SelfAttention(config)
-        self.mlp = MLP(config)
-
-    def forward(self, x, attention_mask=None):
-        x = x + self.attn(norm(x), attention_mask)
-        x = x + self.mlp(norm(x))
-        return x
-
-
 class Classifier(nn.Module):
+    """CNN-based text classifier - fast and good at detecting local patterns."""
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
-        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-        self.classifier = nn.Linear(config.n_embd, config.num_classes)
+
+        # Multi-scale CNN: detect patterns of different sizes (odd kernels for same padding)
+        self.convs = nn.ModuleList([
+            nn.Conv1d(config.n_embd, 128, kernel_size=k, padding=k//2)
+            for k in [3, 5, 7, 9]  # various n-gram sizes
+        ])
+
         self.dropout = nn.Dropout(config.dropout)
+        self.classifier = nn.Linear(128 * 4, config.num_classes)  # 4 conv outputs
 
     def forward(self, input_ids, attention_mask=None):
-        x = self.wte(input_ids)
-        x = self.dropout(x)
+        x = self.wte(input_ids)  # [B, T, C]
+        x = x.transpose(1, 2)  # [B, C, T] for conv1d
 
-        for block in self.blocks:
-            x = block(x, attention_mask)
+        # Apply each conv and max pool
+        conv_outputs = []
+        for conv in self.convs:
+            h = F.gelu(conv(x))  # [B, 128, T]
+            if attention_mask is not None:
+                mask = attention_mask.unsqueeze(1).float()  # [B, 1, T]
+                h = h.masked_fill(mask == 0, float('-inf'))
+            h = h.max(dim=2)[0]  # [B, 128]
+            conv_outputs.append(h)
 
-        x = norm(x)
-        # Pool: max pooling over sequence
-        if attention_mask is not None:
-            mask = attention_mask.unsqueeze(-1).float()
-            x = x.masked_fill(mask == 0, float('-inf'))
-        pooled = x.max(dim=1)[0]
+        pooled = torch.cat(conv_outputs, dim=1)  # [B, 512]
+        pooled = self.dropout(pooled)
         logits = self.classifier(pooled)
         return logits
 
