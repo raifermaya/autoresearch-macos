@@ -51,12 +51,12 @@ class Classifier(nn.Module):
 
         # Multi-scale CNN: detect patterns of different sizes (odd kernels for same padding)
         self.convs = nn.ModuleList([
-            nn.Conv1d(config.n_embd, 128, kernel_size=k, padding=k//2)
+            nn.Conv1d(config.n_embd, 200, kernel_size=k, padding=k//2)
             for k in [3, 5, 7, 9]  # various n-gram sizes
         ])
 
         self.dropout = nn.Dropout(config.dropout)
-        self.classifier = nn.Linear(128 * 4, config.num_classes)  # 4 conv outputs
+        self.classifier = nn.Linear(200 * 4, config.num_classes)  # 4 conv outputs
 
     def forward(self, input_ids, attention_mask=None):
         x = self.wte(input_ids)  # [B, T, C]
@@ -65,14 +65,14 @@ class Classifier(nn.Module):
         # Apply each conv and max pool
         conv_outputs = []
         for conv in self.convs:
-            h = F.gelu(conv(x))  # [B, 128, T]
+            h = F.gelu(conv(x))  # [B, 200, T]
             if attention_mask is not None:
                 mask = attention_mask.unsqueeze(1).float()  # [B, 1, T]
                 h = h.masked_fill(mask == 0, float('-inf'))
-            h = h.max(dim=2)[0]  # [B, 128]
+            h = h.max(dim=2)[0]  # [B, 200]
             conv_outputs.append(h)
 
-        pooled = torch.cat(conv_outputs, dim=1)  # [B, 512]
+        pooled = torch.cat(conv_outputs, dim=1)  # [B, 800]
         pooled = self.dropout(pooled)
         logits = self.classifier(pooled)
         return logits
