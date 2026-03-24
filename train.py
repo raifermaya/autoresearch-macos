@@ -1,7 +1,9 @@
 """
 Self-harm classification training script using XLM-RoBERTa.
-Usage: uv run train.py
+Usage: uv run train.py [--undersample] [--undersample-ratio 1.5] [--class-weight 1.0] ...
 """
+
+import argparse
 
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
@@ -27,6 +29,21 @@ def verify_macos_env():
 verify_macos_env()
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, load_data, train_val_split, evaluate_f05
+
+# ---------------------------------------------------------------------------
+# Command-line arguments (for autoresearch agent control)
+# ---------------------------------------------------------------------------
+
+parser = argparse.ArgumentParser(description="Train XLM-RoBERTa classifier")
+# Class imbalance handling
+parser.add_argument("--undersample", action="store_true", default=True, help="Undersample majority class")
+parser.add_argument("--no-undersample", dest="undersample", action="store_false", help="Disable undersampling")
+parser.add_argument("--undersample-ratio", type=float, default=1.5, help="Ratio of neg:pos after undersampling")
+parser.add_argument("--focal-loss", action="store_true", default=True, help="Use focal loss")
+parser.add_argument("--no-focal-loss", dest="focal_loss", action="store_false", help="Use cross-entropy instead")
+parser.add_argument("--focal-gamma", type=float, default=2.0, help="Focal loss gamma parameter")
+parser.add_argument("--class-weight", type=float, default=1.0, help="Weight for positive class in loss")
+args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
 # Focal Loss for class imbalance
@@ -127,7 +144,7 @@ class XLMRobertaClassifier(nn.Module):
 # Custom DataLoader
 # ---------------------------------------------------------------------------
 
-def make_xlm_dataloader(tokenizer_wrapper, batch_size, split, val_ratio=0.1, undersample=True):
+def make_xlm_dataloader(tokenizer_wrapper, batch_size, split, val_ratio=0.1, undersample=True, undersample_ratio=1.5):
     """Create dataloader using XLM-RoBERTa tokenizer with optional undersampling."""
     texts, labels = load_data()
     (train_texts, train_labels), (val_texts, val_labels) = train_val_split(texts, labels, val_ratio)
@@ -144,7 +161,6 @@ def make_xlm_dataloader(tokenizer_wrapper, batch_size, split, val_ratio=0.1, und
             neg_indices = [i for i, l in enumerate(data_labels) if l == 0]
 
             # Undersample negatives to match positives (or slight oversample ratio)
-            undersample_ratio = 1.5  # keep 1.5x negatives vs positives for better precision
             target_neg = int(len(pos_indices) * undersample_ratio)
             sampled_neg = random.sample(neg_indices, min(target_neg, len(neg_indices)))
 
@@ -199,13 +215,14 @@ WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.1
 NUM_CLASSES = 2
 FREEZE_BASE = True      # freeze base model for speed
-USE_FOCAL_LOSS = True   # focal loss for imbalance
-FOCAL_GAMMA = 2.0
+UNFREEZE_TOP_N = 4  # unfreeze top N encoder layers
 
-# Class weights (inverse of frequency): negative=28101, positive=4977
-# Weight ratio ≈ 5.6 for positive class
-CLASS_WEIGHT_POSITIVE = 1.0  # no weighting - data is balanced via undersampling
-UNFREEZE_TOP_N = 1  # unfreeze top N encoder layers
+# Class imbalance handling (controlled via command-line args)
+UNDERSAMPLE = args.undersample
+UNDERSAMPLE_RATIO = args.undersample_ratio
+USE_FOCAL_LOSS = args.focal_loss
+FOCAL_GAMMA = args.focal_gamma
+CLASS_WEIGHT_POSITIVE = args.class_weight
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -246,7 +263,7 @@ else:
     criterion = lambda logits, labels: F.cross_entropy(logits, labels, weight=class_weights)
     print(f"Using weighted CrossEntropy, class_weights={class_weights.tolist()}")
 
-train_loader = make_xlm_dataloader(tokenizer, BATCH_SIZE, "train")
+train_loader = make_xlm_dataloader(tokenizer, BATCH_SIZE, "train", undersample=UNDERSAMPLE, undersample_ratio=UNDERSAMPLE_RATIO)
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Batch size: {BATCH_SIZE}, Accumulation steps: {ACCUMULATION_STEPS}, Effective batch: {BATCH_SIZE * ACCUMULATION_STEPS}")
@@ -356,3 +373,7 @@ print(f"trainable_params: {trainable_params:,}")
 print(f"model:            {MODEL_NAME}")
 print(f"freeze_base:      {FREEZE_BASE}")
 print(f"focal_loss:       {USE_FOCAL_LOSS}")
+print(f"focal_gamma:      {FOCAL_GAMMA}")
+print(f"class_weight:     {CLASS_WEIGHT_POSITIVE}")
+print(f"undersample:      {UNDERSAMPLE}")
+print(f"undersample_ratio:{UNDERSAMPLE_RATIO}")
