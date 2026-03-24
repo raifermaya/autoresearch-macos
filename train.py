@@ -1,5 +1,5 @@
 """
-Self-harm classification training script. Single-GPU, single-file.
+Self-harm classification training script using XLM-RoBERTa.
 Usage: uv run train.py
 """
 
@@ -8,12 +8,13 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import gc
 import time
-from dataclasses import dataclass, asdict
-
+import math
 import sys
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import XLMRobertaTokenizer, XLMRobertaModel
 
 def verify_macos_env():
     if sys.platform != "darwin":
@@ -25,75 +26,186 @@ def verify_macos_env():
 
 verify_macos_env()
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_f05
+from prepare import MAX_SEQ_LEN, TIME_BUDGET, load_data, train_val_split, evaluate_f05
 
 # ---------------------------------------------------------------------------
-# Classifier Model
+# Focal Loss for class imbalance
 # ---------------------------------------------------------------------------
 
-@dataclass
-class ClassifierConfig:
-    sequence_len: int = 512
-    vocab_size: int = 8192
-    n_layer: int = 6
-    n_head: int = 6
-    n_embd: int = 384
-    num_classes: int = 2
-    dropout: float = 0.1
-
-
-class Classifier(nn.Module):
-    """CNN-based text classifier - fast and good at detecting local patterns."""
-    def __init__(self, config):
+class FocalLoss(nn.Module):
+    """Focal loss for imbalanced classification."""
+    def __init__(self, alpha=None, gamma=2.0):
         super().__init__()
-        self.config = config
-        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
+        self.alpha = alpha  # class weights
+        self.gamma = gamma  # focusing parameter
 
-        # Multi-scale CNN: detect patterns of different sizes (odd kernels for same padding)
-        self.convs = nn.ModuleList([
-            nn.Conv1d(config.n_embd, 200, kernel_size=k, padding=k//2)
-            for k in [3, 5, 7, 9]  # various n-gram sizes
-        ])
+    def forward(self, logits, targets):
+        ce_loss = F.cross_entropy(logits, targets, weight=self.alpha, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
 
-        self.dropout = nn.Dropout(config.dropout)
-        self.classifier = nn.Linear(200 * 4, config.num_classes)  # 4 conv outputs
+
+# ---------------------------------------------------------------------------
+# XLM-RoBERTa Tokenizer Wrapper
+# ---------------------------------------------------------------------------
+
+class XLMRobertaTokenizerWrapper:
+    """Wrapper to make XLM-RoBERTa tokenizer compatible with prepare.py interface."""
+
+    def __init__(self, model_name="xlm-roberta-base"):
+        self.tokenizer = XLMRobertaTokenizer.from_pretrained(model_name)
+        self.pad_token_id = self.tokenizer.pad_token_id
+        self.cls_token_id = self.tokenizer.cls_token_id
+
+    def get_vocab_size(self):
+        return self.tokenizer.vocab_size
+
+    def get_pad_token_id(self):
+        return self.pad_token_id
+
+    def get_cls_token_id(self):
+        return self.cls_token_id
+
+    def encode(self, text, max_length=MAX_SEQ_LEN):
+        encoded = self.tokenizer(
+            text,
+            max_length=max_length,
+            padding='max_length',
+            truncation=True,
+            return_tensors=None
+        )
+        return encoded['input_ids']
+
+    def encode_batch(self, texts, max_length=MAX_SEQ_LEN):
+        return [self.encode(text, max_length) for text in texts]
+
+    def decode(self, ids):
+        return self.tokenizer.decode(ids, skip_special_tokens=True)
+
+
+# ---------------------------------------------------------------------------
+# XLM-RoBERTa Classifier
+# ---------------------------------------------------------------------------
+
+class XLMRobertaClassifier(nn.Module):
+    """XLM-RoBERTa for sequence classification with optional freezing."""
+
+    def __init__(self, model_name="xlm-roberta-base", num_classes=2, dropout=0.1, freeze_base=True, unfreeze_top_n=2):
+        super().__init__()
+        self.roberta = XLMRobertaModel.from_pretrained(model_name)
+
+        # Freeze base model for faster training, but unfreeze top N layers
+        if freeze_base:
+            for param in self.roberta.parameters():
+                param.requires_grad = False
+            # Unfreeze top N encoder layers
+            num_layers = len(self.roberta.encoder.layer)
+            for i in range(num_layers - unfreeze_top_n, num_layers):
+                for param in self.roberta.encoder.layer[i].parameters():
+                    param.requires_grad = True
+            print(f"Base model partially frozen - top {unfreeze_top_n} layers + classifier trainable")
+
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(self.roberta.config.hidden_size, num_classes)
 
     def forward(self, input_ids, attention_mask=None):
-        x = self.wte(input_ids)  # [B, T, C]
-        x = x.transpose(1, 2)  # [B, C, T] for conv1d
-
-        # Apply each conv and max pool
-        conv_outputs = []
-        for conv in self.convs:
-            h = F.gelu(conv(x))  # [B, 200, T]
-            if attention_mask is not None:
-                mask = attention_mask.unsqueeze(1).float()  # [B, 1, T]
-                h = h.masked_fill(mask == 0, float('-inf'))
-            h = h.max(dim=2)[0]  # [B, 200]
-            conv_outputs.append(h)
-
-        pooled = torch.cat(conv_outputs, dim=1)  # [B, 800]
-        pooled = self.dropout(pooled)
-        logits = self.classifier(pooled)
+        outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
+        cls_output = outputs.last_hidden_state[:, 0, :]
+        cls_output = self.dropout(cls_output)
+        logits = self.classifier(cls_output)
         return logits
 
     def num_params(self):
         return sum(p.numel() for p in self.parameters())
+
+    def num_trainable_params(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+# ---------------------------------------------------------------------------
+# Custom DataLoader
+# ---------------------------------------------------------------------------
+
+def make_xlm_dataloader(tokenizer_wrapper, batch_size, split, val_ratio=0.1, undersample=True):
+    """Create dataloader using XLM-RoBERTa tokenizer with optional undersampling."""
+    texts, labels = load_data()
+    (train_texts, train_labels), (val_texts, val_labels) = train_val_split(texts, labels, val_ratio)
+
+    if split == "train":
+        data_texts, data_labels = train_texts, train_labels
+
+        # Undersample majority class for training
+        if undersample:
+            import random
+            random.seed(42)
+
+            pos_indices = [i for i, l in enumerate(data_labels) if l == 1]
+            neg_indices = [i for i, l in enumerate(data_labels) if l == 0]
+
+            # Undersample negatives to match positives (or slight oversample ratio)
+            undersample_ratio = 1.5  # keep 1.5x negatives vs positives for better precision
+            target_neg = int(len(pos_indices) * undersample_ratio)
+            sampled_neg = random.sample(neg_indices, min(target_neg, len(neg_indices)))
+
+            balanced_indices = pos_indices + sampled_neg
+            random.shuffle(balanced_indices)
+
+            data_texts = [data_texts[i] for i in balanced_indices]
+            data_labels = [data_labels[i] for i in balanced_indices]
+            print(f"Undersampled training data: {len(data_texts)} samples (pos={len(pos_indices)}, neg={len(sampled_neg)})")
+    else:
+        data_texts, data_labels = val_texts, val_labels
+
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+
+    import random
+    indices = list(range(len(data_texts)))
+
+    while True:
+        if split == "train":
+            random.shuffle(indices)
+
+        for i in range(0, len(indices), batch_size):
+            batch_indices = indices[i:i + batch_size]
+            if len(batch_indices) < batch_size and split == "train":
+                continue
+
+            batch_texts = [data_texts[j] for j in batch_indices]
+            batch_labels = [data_labels[j] for j in batch_indices]
+
+            input_ids = tokenizer_wrapper.encode_batch(batch_texts)
+            input_ids = torch.tensor(input_ids, dtype=torch.long, device=device)
+            attention_mask = (input_ids != tokenizer_wrapper.get_pad_token_id()).long()
+            labels_tensor = torch.tensor(batch_labels, dtype=torch.long, device=device)
+
+            yield input_ids, attention_mask, labels_tensor
+
+        if split == "val":
+            break
 
 
 # ---------------------------------------------------------------------------
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-DEPTH = 3
-N_HEAD = 6
-N_EMBD = 384
+MODEL_NAME = "xlm-roberta-base"
 DROPOUT = 0.1
-BATCH_SIZE = 64
-LEARNING_RATE = 1e-3
+BATCH_SIZE = 8
+ACCUMULATION_STEPS = 4  # effective batch = 32
+CLASSIFIER_LR = 1e-3    # high LR for classifier head
+BASE_LR = 2e-5          # low LR for base (if unfrozen)
 WEIGHT_DECAY = 0.01
-WARMUP_RATIO = 0.2
+WARMUP_RATIO = 0.1
 NUM_CLASSES = 2
+FREEZE_BASE = True      # freeze base model for speed
+USE_FOCAL_LOSS = True   # focal loss for imbalance
+FOCAL_GAMMA = 2.0
+
+# Class weights (inverse of frequency): negative=28101, positive=4977
+# Weight ratio ≈ 5.6 for positive class
+CLASS_WEIGHT_POSITIVE = 1.0  # no weighting - data is balanced via undersampling
+UNFREEZE_TOP_N = 1  # unfreeze top N encoder layers
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -106,43 +218,47 @@ torch.set_float32_matmul_precision("high")
 device_type = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 device = torch.device(device_type)
 
-tokenizer = Tokenizer.from_directory()
+print(f"Loading XLM-RoBERTa tokenizer and model...")
+tokenizer = XLMRobertaTokenizerWrapper(MODEL_NAME)
 vocab_size = tokenizer.get_vocab_size()
 print(f"Vocab size: {vocab_size:,}")
 
-config = ClassifierConfig(
-    sequence_len=MAX_SEQ_LEN,
-    vocab_size=vocab_size,
-    n_layer=DEPTH,
-    n_head=N_HEAD,
-    n_embd=N_EMBD,
-    num_classes=NUM_CLASSES,
-    dropout=DROPOUT,
-)
-print(f"Model config: {asdict(config)}")
-
-model = Classifier(config).to(device)
+model = XLMRobertaClassifier(MODEL_NAME, NUM_CLASSES, DROPOUT, freeze_base=FREEZE_BASE, unfreeze_top_n=UNFREEZE_TOP_N).to(device)
 num_params = model.num_params()
-print(f"Parameters: {num_params:,}")
+trainable_params = model.num_trainable_params()
+print(f"Total parameters: {num_params:,}")
+print(f"Trainable parameters: {trainable_params:,}")
 
+# Optimizer for all trainable parameters
+trainable_params_list = [p for p in model.parameters() if p.requires_grad]
 optimizer = torch.optim.AdamW(
-    model.parameters(),
-    lr=LEARNING_RATE,
+    trainable_params_list,
+    lr=CLASSIFIER_LR,
     weight_decay=WEIGHT_DECAY,
-    betas=(0.9, 0.999),
 )
 
-train_loader = make_dataloader(tokenizer, BATCH_SIZE, "train")
+# Loss function with class weights
+class_weights = torch.tensor([1.0, CLASS_WEIGHT_POSITIVE], device=device)
+if USE_FOCAL_LOSS:
+    criterion = FocalLoss(alpha=class_weights, gamma=FOCAL_GAMMA)
+    print(f"Using Focal Loss with gamma={FOCAL_GAMMA}, class_weights={class_weights.tolist()}")
+else:
+    criterion = lambda logits, labels: F.cross_entropy(logits, labels, weight=class_weights)
+    print(f"Using weighted CrossEntropy, class_weights={class_weights.tolist()}")
+
+train_loader = make_xlm_dataloader(tokenizer, BATCH_SIZE, "train")
 
 print(f"Time budget: {TIME_BUDGET}s")
+print(f"Batch size: {BATCH_SIZE}, Accumulation steps: {ACCUMULATION_STEPS}, Effective batch: {BATCH_SIZE * ACCUMULATION_STEPS}")
 
 # ---------------------------------------------------------------------------
-# Training loop
+# Training loop with gradient accumulation
 # ---------------------------------------------------------------------------
 
 t_start_training = time.time()
 total_training_time = 0
 step = 0
+accum_step = 0
 smooth_loss = 0
 
 def sync_device(device_type):
@@ -152,56 +268,63 @@ def sync_device(device_type):
         torch.mps.synchronize()
 
 model.train()
+optimizer.zero_grad()
+
 for input_ids, attention_mask, labels in train_loader:
     sync_device(device_type)
     t0 = time.time()
 
-    # LR schedule with cosine annealing
-    import math
+    # LR schedule with warmup and cosine annealing
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     if progress < WARMUP_RATIO:
         lr_mult = progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
     else:
         decay_progress = (progress - WARMUP_RATIO) / (1.0 - WARMUP_RATIO)
         lr_mult = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
-    lr = LEARNING_RATE * max(lr_mult, 0.1)
+
+    current_lr = CLASSIFIER_LR * max(lr_mult, 0.01)
     for g in optimizer.param_groups:
-        g['lr'] = lr
+        g['lr'] = current_lr
 
     # Forward
     logits = model(input_ids, attention_mask)
-    loss = F.cross_entropy(logits, labels)
+    loss = criterion(logits, labels) / ACCUMULATION_STEPS
 
-    # Backward
-    optimizer.zero_grad()
+    # Backward (accumulate gradients)
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    optimizer.step()
+
+    accum_step += 1
+
+    # Update weights after accumulation
+    if accum_step % ACCUMULATION_STEPS == 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        optimizer.zero_grad()
+        step += 1
 
     sync_device(device_type)
     t1 = time.time()
     dt = t1 - t0
 
-    if step > 5:
+    if accum_step > 5:
         total_training_time += dt
 
     # Logging
-    loss_f = loss.item()
+    loss_f = loss.item() * ACCUMULATION_STEPS
     smooth_loss = 0.9 * smooth_loss + 0.1 * loss_f
-    debiased_loss = smooth_loss / (1 - 0.9**(step + 1))
+    debiased_loss = smooth_loss / (1 - 0.9**(accum_step + 1))
     pct_done = 100 * progress
     remaining = max(0, TIME_BUDGET - total_training_time)
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_loss:.4f} | lr: {lr:.2e} | dt: {dt*1000:.0f}ms | remaining: {remaining:.0f}s    ", end="", flush=True)
+    if accum_step % ACCUMULATION_STEPS == 0:
+        print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_loss:.4f} | lr: {current_lr:.2e} | dt: {dt*1000:.0f}ms | remaining: {remaining:.0f}s    ", end="", flush=True)
 
-    if step == 0:
+    if accum_step == 1:
         gc.collect()
         gc.freeze()
         gc.disable()
 
-    step += 1
-
-    if step > 5 and total_training_time >= TIME_BUDGET:
+    if accum_step > 5 and total_training_time >= TIME_BUDGET:
         break
 
 print()
@@ -229,4 +352,7 @@ print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"depth:            {DEPTH}")
+print(f"trainable_params: {trainable_params:,}")
+print(f"model:            {MODEL_NAME}")
+print(f"freeze_base:      {FREEZE_BASE}")
+print(f"focal_loss:       {USE_FOCAL_LOSS}")
