@@ -43,7 +43,11 @@ parser.add_argument("--focal-loss", action="store_true", default=True, help="Use
 parser.add_argument("--no-focal-loss", dest="focal_loss", action="store_false", help="Use cross-entropy instead")
 parser.add_argument("--focal-gamma", type=float, default=2.0, help="Focal loss gamma parameter")
 parser.add_argument("--class-weight", type=float, default=1.0, help="Weight for positive class in loss")
+parser.add_argument("--time-budget", type=int, default=300, help="Training time budget in seconds")
 args = parser.parse_args()
+
+# Override TIME_BUDGET if specified
+TIME_BUDGET = args.time_budget
 
 # ---------------------------------------------------------------------------
 # Focal Loss for class imbalance
@@ -207,12 +211,13 @@ def make_xlm_dataloader(tokenizer_wrapper, batch_size, split, val_ratio=0.1, und
 
 MODEL_NAME = "xlm-roberta-base"
 DROPOUT = 0.1
-BATCH_SIZE = 8
-ACCUMULATION_STEPS = 4  # effective batch = 32
-CLASSIFIER_LR = 1e-3    # high LR for classifier head
-BASE_LR = 2e-5          # low LR for base (if unfrozen)
-WEIGHT_DECAY = 0.01
-WARMUP_RATIO = 0.1
+BATCH_SIZE = 16
+ACCUMULATION_STEPS = 1  # no accumulation
+CLASSIFIER_LR = 1e-5    # lower LR matching successful setup
+BASE_LR = 1e-5          # base LR for encoder layers
+LLRD_DECAY = 0.95       # layerwise LR decay (lower layers get smaller LR)
+WEIGHT_DECAY = 0.001    # lower weight decay
+WARMUP_RATIO = 0.0      # no warmup
 NUM_CLASSES = 2
 FREEZE_BASE = True      # freeze base model for speed
 UNFREEZE_TOP_N = 4  # unfreeze top N encoder layers
@@ -246,13 +251,47 @@ trainable_params = model.num_trainable_params()
 print(f"Total parameters: {num_params:,}")
 print(f"Trainable parameters: {trainable_params:,}")
 
-# Optimizer for all trainable parameters
-trainable_params_list = [p for p in model.parameters() if p.requires_grad]
-optimizer = torch.optim.AdamW(
-    trainable_params_list,
-    lr=CLASSIFIER_LR,
-    weight_decay=WEIGHT_DECAY,
-)
+# Optimizer with Layerwise Learning Rate Decay (LLRD)
+def get_llrd_params(model, base_lr, llrd_decay, weight_decay):
+    """Create parameter groups with layerwise learning rate decay."""
+    param_groups = []
+
+    # Classifier head gets the base LR
+    classifier_params = list(model.classifier.parameters()) + list(model.dropout.parameters())
+    param_groups.append({
+        'params': [p for p in classifier_params if p.requires_grad],
+        'lr': base_lr,
+        'name': 'classifier'
+    })
+
+    # Encoder layers get decaying LR (top layer = base_lr * decay, next = base_lr * decay^2, etc.)
+    num_layers = len(model.roberta.encoder.layer)
+    for i in range(num_layers - 1, -1, -1):
+        layer = model.roberta.encoder.layer[i]
+        layer_params = [p for p in layer.parameters() if p.requires_grad]
+        if layer_params:
+            # Distance from top: 0 for top layer, 1 for second from top, etc.
+            distance_from_top = num_layers - 1 - i
+            layer_lr = base_lr * (llrd_decay ** (distance_from_top + 1))
+            param_groups.append({
+                'params': layer_params,
+                'lr': layer_lr,
+                'name': f'layer_{i}'
+            })
+
+    # Apply weight decay to all groups
+    for group in param_groups:
+        group['weight_decay'] = weight_decay
+
+    return param_groups
+
+param_groups = get_llrd_params(model, CLASSIFIER_LR, LLRD_DECAY, WEIGHT_DECAY)
+optimizer = torch.optim.AdamW(param_groups)
+
+# Print LLRD info
+print(f"LLRD enabled (decay={LLRD_DECAY}):")
+for g in param_groups[:3]:  # show first 3 groups
+    print(f"  {g['name']}: lr={g['lr']:.2e}")
 
 # Loss function with class weights
 class_weights = torch.tensor([1.0, CLASS_WEIGHT_POSITIVE], device=device)
@@ -291,7 +330,7 @@ for input_ids, attention_mask, labels in train_loader:
     sync_device(device_type)
     t0 = time.time()
 
-    # LR schedule with warmup and cosine annealing
+    # LR schedule with warmup and cosine annealing (preserves LLRD ratios)
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     if progress < WARMUP_RATIO:
         lr_mult = progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
@@ -299,9 +338,14 @@ for input_ids, attention_mask, labels in train_loader:
         decay_progress = (progress - WARMUP_RATIO) / (1.0 - WARMUP_RATIO)
         lr_mult = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
 
-    current_lr = CLASSIFIER_LR * max(lr_mult, 0.01)
+    lr_mult = max(lr_mult, 0.01)
+    current_lr = CLASSIFIER_LR * lr_mult
     for g in optimizer.param_groups:
-        g['lr'] = current_lr
+        # Scale each group's base LR by the schedule multiplier (preserves LLRD ratios)
+        base_lr = g.get('initial_lr', g['lr'])
+        if 'initial_lr' not in g:
+            g['initial_lr'] = g['lr']
+        g['lr'] = base_lr * lr_mult
 
     # Forward
     logits = model(input_ids, attention_mask)
@@ -377,3 +421,4 @@ print(f"focal_gamma:      {FOCAL_GAMMA}")
 print(f"class_weight:     {CLASS_WEIGHT_POSITIVE}")
 print(f"undersample:      {UNDERSAMPLE}")
 print(f"undersample_ratio:{UNDERSAMPLE_RATIO}")
+print(f"llrd_decay:       {LLRD_DECAY}")
